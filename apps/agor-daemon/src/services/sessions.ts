@@ -1610,7 +1610,8 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
     archived: boolean,
     options: SessionArchiveOptions | undefined,
     params?: SessionParams,
-    rootReason: SessionArchiveReason = MANUAL_ARCHIVED_REASON
+    rootReason: SessionArchiveReason = MANUAL_ARCHIVED_REASON,
+    requireNoUnfinishedTasks = false
   ): Promise<SessionArchiveResult> {
     const root = await this.get(id, params);
     const includeChildren = options?.includeChildren !== false;
@@ -1627,6 +1628,12 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
       archived,
       params
     );
+
+    if (requireNoUnfinishedTasks) {
+      await this.assertNoUnfinishedTasks(
+        targets.filter((target) => target.archived).map((target) => target.session)
+      );
+    }
 
     const affectedSessions = await this.applyArchiveTargets(targets, params);
 
@@ -1685,6 +1692,21 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
   }
 
   /**
+   * Refuse to archive sessions that still own unfinished tasks. Archiving only
+   * hides a session; it never stops the executor, so stopping stays an explicit
+   * operation (mirrors the guard in removeOne).
+   */
+  private async assertNoUnfinishedTasks(sessions: Session[]): Promise<void> {
+    for (const session of sessions) {
+      if (await this.taskRepo.hasNonterminalForSession(session.session_id)) {
+        throw new Conflict(
+          `Cannot archive session ${session.session_id} while it has unfinished tasks. Stop them first.`
+        );
+      }
+    }
+  }
+
+  /**
    * Archive a session and, by default, its branch-local descendants.
    */
   async archive(
@@ -1692,7 +1714,7 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
     options?: SessionArchiveOptions,
     params?: SessionParams
   ): Promise<SessionArchiveResult> {
-    return this.setArchiveStateForTree(id, true, options, params);
+    return this.setArchiveStateForTree(id, true, options, params, MANUAL_ARCHIVED_REASON, true);
   }
 
   /**
@@ -1768,9 +1790,10 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
     for (const unit of plan.units) {
       try {
         await this.assertCanArchiveSessions(unit.sessions, true, params);
+        await this.assertNoUnfinishedTasks(unit.sessions);
         authorizedTargets.push(...unit.targets);
       } catch (error) {
-        if (!(error instanceof Forbidden)) throw error;
+        if (!(error instanceof Forbidden) && !(error instanceof Conflict)) throw error;
         skipped.push({
           session_id: unit.root.session_id,
           error: error.message,

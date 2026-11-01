@@ -5,11 +5,12 @@ import {
   RepoRepository,
   SessionRelationshipRepository,
   SessionRepository,
+  TaskRepository,
   UsersRepository,
 } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
 import type { Branch, Session, SessionID, UUID } from '@agor/core/types';
-import { ROLES, SessionStatus } from '@agor/core/types';
+import { ROLES, SessionStatus, TaskStatus } from '@agor/core/types';
 import { describe, expect, vi } from 'vitest';
 import { dbTest } from '../../../../packages/core/src/db/test-helpers';
 import { type SessionParams, SessionsService } from './sessions';
@@ -107,6 +108,18 @@ async function createSession(
     contextFiles: [],
     genealogy: { children: [] },
     ...overrides,
+  });
+}
+
+async function createRunningTask(db: any, sessionId: SessionID): Promise<void> {
+  await new TaskRepository(db).create({
+    task_id: generateId(),
+    session_id: sessionId,
+    created_by: TEST_USER_ID,
+    full_prompt: 'still working',
+    status: TaskStatus.RUNNING,
+    message_range: { start_index: 0, end_index: 1, start_timestamp: new Date().toISOString() },
+    git_state: { ref_at_start: 'main', sha_at_start: 'abc123' },
   });
 }
 
@@ -306,6 +319,55 @@ describe('SessionsService archive routes', () => {
     });
     await expect(getArchivedState(db, child.session_id)).resolves.toMatchObject({
       archived: false,
+    });
+  });
+
+  dbTest('refuses to archive sessions with unfinished tasks', async ({ db }) => {
+    const service = new SessionsService(db, STUB_APP);
+    const branchId = await createBranch(db);
+    const parent = await createSession(db, branchId);
+    const child = await createSession(db, branchId, {
+      genealogy: { parent_session_id: parent.session_id, children: [] },
+    });
+    await createRunningTask(db, child.session_id);
+
+    await expect(service.archive(child.session_id)).rejects.toThrow(/unfinished tasks/);
+    // A tree archive considers unfinished descendants too.
+    await expect(service.archive(parent.session_id)).rejects.toThrow(/unfinished tasks/);
+    for (const session of [parent, child]) {
+      await expect(getArchivedState(db, session.session_id)).resolves.toMatchObject({
+        archived: false,
+      });
+    }
+
+    // Root-only archive does not touch the busy descendant.
+    await service.archive(parent.session_id, { includeChildren: false });
+    await expect(getArchivedState(db, parent.session_id)).resolves.toMatchObject({
+      archived: true,
+    });
+  });
+
+  dbTest('bulk archive reports trees with unfinished tasks as skipped', async ({ db }) => {
+    const service = new SessionsService(db, STUB_APP);
+    const branchId = await createBranch(db);
+    const busy = await createSession(db, branchId);
+    const idle = await createSession(db, branchId);
+    await createRunningTask(db, busy.session_id);
+
+    const result = await service.archiveRootsInBranch(
+      branchId,
+      [busy.session_id, idle.session_id],
+      { includeChildren: false }
+    );
+
+    expect(result.skipped).toEqual([
+      { session_id: busy.session_id, error: expect.stringMatching(/unfinished tasks/) },
+    ]);
+    await expect(getArchivedState(db, busy.session_id)).resolves.toMatchObject({
+      archived: false,
+    });
+    await expect(getArchivedState(db, idle.session_id)).resolves.toMatchObject({
+      archived: true,
     });
   });
 
